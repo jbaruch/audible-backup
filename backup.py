@@ -101,6 +101,11 @@ def download_and_decrypt(
         log(f"FAILED to download {asin}: {result.stderr[-500:]}")
         return {**book, "status": "failed", "error": "download failed"}
 
+    # audible-cli exits 0 but prints "not downloadable" for unowned books
+    if "not downloadable" in result.stdout + result.stderr:
+        log(f"SKIPPED: {title} — not downloadable (not owned or Plus-only)")
+        return {**book, "status": "skipped", "error": "not downloadable"}
+
     # Find downloaded files
     audio_files = list(download_dir.glob(f"{asin}*.aax")) + list(
         download_dir.glob(f"{asin}*.aaxc")
@@ -208,6 +213,7 @@ def main():
 
     downloaded = 0
     failed = 0
+    skipped = 0
     results = []
 
     for book in new_books:
@@ -215,6 +221,8 @@ def main():
         results.append(result)
         if result["status"] == "ok":
             downloaded += 1
+        elif result["status"] == "skipped":
+            skipped += 1
         else:
             failed += 1
 
@@ -224,6 +232,7 @@ def main():
         print(json.dumps({
             "new_books": len(new_books),
             "downloaded": downloaded,
+            "skipped": skipped,
             "failed": failed,
             "books": results,
         }))
