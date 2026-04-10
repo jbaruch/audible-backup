@@ -52,18 +52,15 @@ def export_audible_library(tmp_dir: Path) -> list[dict]:
 def find_new_books(
     library: list[dict], known_asins: set[str]
 ) -> list[dict]:
-    """Find books in Audible library not in OpenAudible inventory."""
+    """Find books in Audible library not in OpenAudible inventory.
+
+    Returns full records so the caller can update books-library.csv.
+    """
     new = []
     for book in library:
         asin = book.get("asin", "")
         if asin and asin not in known_asins:
-            new.append(
-                {
-                    "asin": asin,
-                    "title": book.get("title", "Unknown"),
-                    "authors": book.get("authors", "Unknown"),
-                }
-            )
+            new.append(book)
     return new
 
 
@@ -74,10 +71,12 @@ def sanitize_filename(title: str) -> str:
 
 
 def download_and_decrypt(
-    asin: str, title: str, download_dir: Path, books_dir: Path,
+    book: dict, download_dir: Path, books_dir: Path,
     aax_dir: Path, art_dir: Path,
-) -> bool:
-    """Download and decrypt a single book. Returns True on success."""
+) -> dict:
+    """Download and decrypt a single book. Returns book dict with status + m4b_path."""
+    asin = book["asin"]
+    title = book.get("title", "Unknown")
     print(f"\n--- Downloading: {title} ({asin}) ---")
 
     # Download
@@ -93,7 +92,7 @@ def download_and_decrypt(
     )
     if result.returncode != 0:
         print(f"FAILED to download {asin}: {result.stderr[-500:]}")
-        return False
+        return {**book, "status": "failed", "error": "download failed"}
 
     # Find downloaded files
     audio_files = list(download_dir.glob(f"{asin}*.aax")) + list(
@@ -101,7 +100,7 @@ def download_and_decrypt(
     )
     if not audio_files:
         print(f"FAILED: no audio file found for {asin}")
-        return False
+        return {**book, "status": "failed", "error": "no audio file after download"}
 
     audio_file = audio_files[0]
     voucher_files = list(download_dir.glob(f"{asin}*.voucher"))
@@ -122,7 +121,7 @@ def download_and_decrypt(
     result = subprocess.run(decrypt_cmd, capture_output=True, text=True)
     if result.returncode != 0 or not output_m4b.exists():
         print(f"FAILED to decrypt {asin}: {result.stderr[-500:]}")
-        return False
+        return {**book, "status": "failed", "error": "decrypt failed"}
 
     print(f"OK: {safe_title}.m4b")
 
@@ -137,7 +136,7 @@ def download_and_decrypt(
     for f in download_dir.glob(f"{asin}*"):
         f.unlink()
 
-    return True
+    return {**book, "status": "ok", "m4b_path": str(output_m4b)}
 
 
 def main():
@@ -178,7 +177,7 @@ def main():
         print(f"Audible library: {len(library)}")
         print(f"New books to download: {len(new_books)}")
         for b in new_books:
-            print(f"  {b['asin']}  {b['title']} — {b['authors']}")
+            print(f"  {b.get('asin')}  {b.get('title', '?')} — {b.get('authors', '?')}")
 
     if not new_books:
         if args.json:
@@ -205,16 +204,12 @@ def main():
     results = []
 
     for book in new_books:
-        ok = download_and_decrypt(
-            book["asin"], book["title"], download_dir,
-            books_dir, aax_dir, art_dir,
-        )
-        if ok:
+        result = download_and_decrypt(book, download_dir, books_dir, aax_dir, art_dir)
+        results.append(result)
+        if result["status"] == "ok":
             downloaded += 1
-            results.append({**book, "status": "ok"})
         else:
             failed += 1
-            results.append({**book, "status": "failed"})
 
     download_dir.rmdir() if not any(download_dir.iterdir()) else None
 
