@@ -64,6 +64,11 @@ def find_new_books(
     return new
 
 
+def log(msg: str) -> None:
+    """Print progress to stderr so stdout stays clean for --json output."""
+    print(msg, file=sys.stderr)
+
+
 def sanitize_filename(title: str) -> str:
     """Make a filesystem-safe filename from a book title."""
     safe = "".join(c for c in title if c.isalnum() or c in " ._-")
@@ -77,7 +82,7 @@ def download_and_decrypt(
     """Download and decrypt a single book. Returns book dict with status + m4b_path."""
     asin = book["asin"]
     title = book.get("title", "Unknown")
-    print(f"\n--- Downloading: {title} ({asin}) ---")
+    log(f"\n--- Downloading: {title} ({asin}) ---")
 
     # Download
     result = subprocess.run(
@@ -91,7 +96,7 @@ def download_and_decrypt(
         text=True,
     )
     if result.returncode != 0:
-        print(f"FAILED to download {asin}: {result.stderr[-500:]}")
+        log(f"FAILED to download {asin}: {result.stderr[-500:]}")
         return {**book, "status": "failed", "error": "download failed"}
 
     # Find downloaded files
@@ -99,7 +104,7 @@ def download_and_decrypt(
         download_dir.glob(f"{asin}*.aaxc")
     )
     if not audio_files:
-        print(f"FAILED: no audio file found for {asin}")
+        log(f"FAILED: no audio file found for {asin}")
         return {**book, "status": "failed", "error": "no audio file after download"}
 
     audio_file = audio_files[0]
@@ -112,7 +117,7 @@ def download_and_decrypt(
     output_m4b = books_dir / f"{safe_title}.m4b"
 
     # Decrypt
-    print("Decrypting to M4B...")
+    log("Decrypting to M4B...")
     decrypt_cmd = ["audible", "decrypt", "--input", str(audio_file)]
     if voucher_files:
         decrypt_cmd += ["--voucher", str(voucher_files[0])]
@@ -120,10 +125,10 @@ def download_and_decrypt(
 
     result = subprocess.run(decrypt_cmd, capture_output=True, text=True)
     if result.returncode != 0 or not output_m4b.exists():
-        print(f"FAILED to decrypt {asin}: {result.stderr[-500:]}")
+        log(f"FAILED to decrypt {asin}: {result.stderr[-500:]}")
         return {**book, "status": "failed", "error": "decrypt failed"}
 
-    print(f"OK: {safe_title}.m4b")
+    log(f"OK: {safe_title}.m4b")
 
     # Cover art
     if cover_files:
