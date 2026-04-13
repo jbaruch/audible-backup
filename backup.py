@@ -24,11 +24,65 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Audible API response groups for enriched library data
+# Audible API response groups for enriched library data.
+# listening_status is REQUIRED — it's the source of is_finished and
+# percent_complete which we need for read_status mapping.
 LIBRARY_RESPONSE_GROUPS = (
     "contributors,product_desc,product_extended_attrs,product_attrs,"
-    "media,rating,series,categories"
+    "media,rating,series,categories,category_ladders,listening_status,"
+    "product_details,reviews,relationships"
 )
+
+
+# Required fields the API must return on every book. If any are missing,
+# the script fails loudly so we know the API contract changed.
+REQUIRED_API_FIELDS = ("asin", "title")
+
+# Fields we expect to populate in every output record. Used by validation
+# to catch silent data loss.
+REQUIRED_OUTPUT_FIELDS = (
+    "asin", "product_id", "title", "author", "narrated_by", "duration",
+    "seconds", "release_date", "image_url", "info_link", "author_link",
+    "abridged", "ayce", "read_status", "genre", "key", "filename", "files",
+    "rating_average", "rating_count", "summary", "description", "copyright",
+    "language", "region", "publisher", "purchase_date", "title_short",
+    "user_id", "download_link",
+    # Series + extras
+    "series_name", "series_sequence", "series_link", "subtitle",
+    "percent_complete", "isbn", "sku", "voice_description", "narration_accent",
+    "format_type", "content_type", "publication_datetime", "date_added",
+    "chapters",
+)
+
+
+class FieldValidationError(Exception):
+    """Raised when a record's fields don't match the expected schema."""
+    pass
+
+
+def py_bool_str(value) -> str:
+    """OpenAudible-compatible bool string: 'true' / 'false' (lowercase)."""
+    return "true" if value else "false"
+
+
+def safe_str(value, default: str = "") -> str:
+    """Return value as string, or default if None/empty."""
+    if value is None or value == "":
+        return default
+    return str(value)
+
+
+def validate_record(record: dict, asin: str) -> None:
+    """Raise FieldValidationError if record is missing required fields.
+
+    Empty values are OK (some books don't have all metadata), but the
+    KEY must be present so downstream consumers can rely on the schema.
+    """
+    missing = [f for f in REQUIRED_OUTPUT_FIELDS if f not in record]
+    if missing:
+        raise FieldValidationError(
+            f"Record for {asin} missing required fields: {missing}"
+        )
 
 
 def find_inventory(library_dir: Path) -> Optional[Path]:
@@ -120,13 +174,26 @@ def find_new_books(library: list[dict], known_asins: set[str]) -> list[dict]:
     ]
 
 
-def map_to_inventory_schema(api_book: dict, region: str = "us") -> dict:
+def map_to_inventory_schema(api_book: dict, region: str = "US") -> dict:
     """Map enriched audible-cli API response to inventory JSON schema.
 
-    Populates everything that maps cleanly. Leaves filename/files for the
-    download step. Includes both legacy OpenAudible fields and new extras.
+    Field conventions match OpenAudible's books.json schema:
+    - Bools serialized as 'true'/'false' lowercase strings
+    - None/missing values become empty strings (not 'None')
+    - URLs use audible.com format
+
+    Raises FieldValidationError if required API fields are missing.
     """
     asin = api_book.get("asin", "")
+    title = safe_str(api_book.get("title"))
+
+    # Validate required API fields
+    for field in REQUIRED_API_FIELDS:
+        if not api_book.get(field):
+            raise FieldValidationError(
+                f"API response missing required field '{field}' "
+                f"for ASIN={asin or '(no asin)'}"
+            )
 
     # Authors and narrators come as lists of {asin, name} dicts
     authors = api_book.get("authors") or []
@@ -134,14 +201,20 @@ def map_to_inventory_schema(api_book: dict, region: str = "us") -> dict:
     author_str = ", ".join(a.get("name", "") for a in authors if a.get("name"))
     narrator_str = ", ".join(n.get("name", "") for n in narrators if n.get("name"))
 
-    # Categories come as nested ladders — flatten unique leaf names
-    genres: list[str] = []
+    # Categories: each "ladder" is a hierarchy path (e.g.,
+    # ["Mystery, Thriller & Suspense", "Crime Fiction"]).
+    # OpenAudible format: "Top:Sub:SubSub" per path, multiple paths comma-separated.
+    genre_paths: list[str] = []
     for ladder in api_book.get("category_ladders") or []:
-        for cat in ladder.get("ladder") or []:
-            name = cat.get("name")
-            if name and name not in genres:
-                genres.append(name)
-    genre_str = ", ".join(genres)
+        names = [
+            cat.get("name") for cat in (ladder.get("ladder") or [])
+            if cat.get("name")
+        ]
+        if names:
+            path = ":".join(names)
+            if path not in genre_paths:
+                genre_paths.append(path)
+    genre_str = ", ".join(genre_paths)
 
     # Rating is nested
     rating = api_book.get("rating") or {}
@@ -160,67 +233,119 @@ def map_to_inventory_schema(api_book: dict, region: str = "us") -> dict:
     # Series — first series in list (book may be in multiple)
     series_list = api_book.get("series") or []
     series_first = series_list[0] if series_list else {}
+    series_name = safe_str(series_first.get("title"))
+    series_sequence = safe_str(series_first.get("sequence"))
+    series_asin = safe_str(series_first.get("asin"))
+    series_link = f"/series/{series_name.replace(' ', '-')}/{series_asin}" if series_asin else ""
 
-    # Author link (Amazon page) — derive from first author's ASIN
+    # Author link — OpenAudible uses audible.com/author/{Name}/{ASIN}
     author_link = ""
-    if authors and authors[0].get("asin"):
-        author_link = f"https://www.amazon.com/author/{authors[0]['asin']}"
+    if authors and authors[0].get("asin") and authors[0].get("name"):
+        name_url = authors[0]["name"].replace(" ", "+")
+        author_link = f"https://www.audible.com/author/{name_url}/{authors[0]['asin']}"
 
-    # is_finished maps to read_status (OpenAudible convention: "" or "READ")
-    read_status = "READ" if api_book.get("is_finished") else ""
+    # info_link — construct from ASIN; API may return None
+    api_info_link = api_book.get("product_page_url")
+    info_link = api_info_link if api_info_link else f"https://www.audible.com/pd/{asin}"
 
-    return {
-        # --- Legacy OpenAudible fields ---
+    # listening_status nested object — required for read_status mapping
+    listening = api_book.get("listening_status") or {}
+    is_finished = listening.get("is_finished") or api_book.get("is_finished")
+    pct = listening.get("percent_complete") or api_book.get("percent_complete") or 0
+
+    # read_status: OpenAudible 3-state convention (Finished/Reading/Unread)
+    if is_finished:
+        read_status = "Finished"
+    elif pct and float(pct) > 0:
+        read_status = "Reading"
+    else:
+        read_status = "Unread"
+
+    record = {
+        # --- Identity ---
         "asin": asin,
-        "product_id": asin,
-        "title": api_book.get("title", ""),
-        "title_short": api_book.get("title", "")[:200],
+        "product_id": safe_str(api_book.get("sku") or asin),
+        "key": safe_str(api_book.get("sku") or asin),
+
+        # --- Titles ---
+        "title": title,
+        "title_short": title[:200],
+        "subtitle": safe_str(api_book.get("subtitle")),
+
+        # --- Contributors ---
         "author": author_str,
         "author_link": author_link,
         "narrated_by": narrator_str,
-        "publisher": api_book.get("publisher_name", ""),
-        "summary": api_book.get("merchandising_summary", ""),
-        "description": api_book.get("publisher_summary", ""),
-        "copyright": api_book.get("copyright", ""),
-        "language": api_book.get("language", ""),
+        "voice_description": safe_str(api_book.get("voice_description")),
+        "narration_accent": safe_str(api_book.get("narration_accent")),
+
+        # --- Publisher / metadata ---
+        "publisher": safe_str(api_book.get("publisher_name")),
+        "summary": safe_str(api_book.get("merchandising_summary")),
+        "description": safe_str(api_book.get("publisher_summary")),
+        "copyright": safe_str(api_book.get("copyright")),
+        "language": safe_str(api_book.get("language")),
         "region": region,
         "genre": genre_str,
+        "format_type": safe_str(api_book.get("format_type")),
+        "content_type": safe_str(api_book.get("content_type")),
+        "isbn": safe_str(api_book.get("isbn")),
+        "sku": safe_str(api_book.get("sku")),
+
+        # --- Ratings ---
         "rating_average": str(rating_average) if rating_average else "",
-        "rating_count": rating_count if rating_count else "",
-        "purchase_date": api_book.get("purchase_date", ""),
-        "release_date": api_book.get("release_date", "") or api_book.get("issue_date", ""),
+        "rating_count": str(rating_count) if rating_count else "",
+
+        # --- Dates ---
+        "purchase_date": safe_str(api_book.get("purchase_date")),
+        "release_date": safe_str(
+            api_book.get("release_date") or api_book.get("issue_date")
+        ),
+        "publication_datetime": safe_str(api_book.get("publication_datetime")),
+        # date_added is nested under library_status, not top-level
+        "date_added": safe_str(
+            (api_book.get("library_status") or {}).get("date_added")
+            or api_book.get("date_added")
+        ),
+
+        # --- Duration ---
         "duration": duration_str,
         "seconds": runtime_sec,
-        "abridged": api_book.get("format_type", "") != "unabridged",
-        "image_url": (api_book.get("product_images") or {}).get("500", "")
-                     or api_book.get("cover_url", ""),
-        "info_link": api_book.get("product_page_url", ""),
-        "download_link": "",
-        "ayce": api_book.get("is_ayce", False),
+
+        # --- Format flags (OpenAudible: lowercase string bools) ---
+        "abridged": py_bool_str(api_book.get("format_type") != "unabridged"),
+        "ayce": py_bool_str(api_book.get("is_ayce")),
+
+        # --- Read status ---
         "read_status": read_status,
+        "percent_complete": float(pct) if pct else 0,
+
+        # --- Series (OpenAudible convention) ---
+        "series_name": series_name,
+        "series_sequence": series_sequence,
+        "series_link": series_link,
+
+        # --- Media URLs ---
+        "image_url": safe_str(
+            (api_book.get("product_images") or {}).get("500")
+            or api_book.get("cover_url")
+        ),
+        "info_link": info_link,
+
+        # --- User-specific (preserved by enrich) ---
         "user_id": "",
-        "key": asin,
+        "download_link": "",
+
+        # --- Local file paths (populated after download) ---
         "filename": "",
         "files": [],
 
-        # --- New extras (audible-cli has, OpenAudible didn't) ---
-        "subtitle": api_book.get("subtitle", ""),
-        "series_title": series_first.get("title", ""),
-        "series_sequence": series_first.get("sequence", ""),
-        "percent_complete": api_book.get("percent_complete", 0),
-        "date_added": api_book.get("date_added", ""),
-        "isbn": api_book.get("isbn", ""),
-        "sku": api_book.get("sku", ""),
-        "voice_description": api_book.get("voice_description", ""),
-        "narration_accent": api_book.get("narration_accent", ""),
-        "format_type": api_book.get("format_type", ""),
-        "content_type": api_book.get("content_type", ""),
-        "publication_datetime": api_book.get("publication_datetime", ""),
-        "goodreads_ratings": api_book.get("goodreads_ratings", []),
-
-        # chapters populated separately via fetch_chapters()
+        # --- Chapters (populated separately via fetch_chapters) ---
         "chapters": [],
     }
+
+    validate_record(record, asin)
+    return record
 
 
 def log(msg: str) -> None:
