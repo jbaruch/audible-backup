@@ -7,6 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir audible-cli
 
 WORKDIR /app
-COPY backup.py /app/
+COPY backup.py enrich.py /app/
 
 ENTRYPOINT ["python3", "/app/backup.py"]
