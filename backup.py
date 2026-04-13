@@ -51,6 +51,8 @@ REQUIRED_OUTPUT_FIELDS = (
     "series_name", "series_sequence", "series_link", "subtitle",
     "percent_complete", "isbn", "sku", "voice_description", "narration_accent",
     "format_type", "content_type", "publication_datetime", "date_added",
+    "performance_rating", "performance_rating_count",
+    "story_rating", "story_rating_count",
     "chapters",
 )
 
@@ -216,11 +218,19 @@ def map_to_inventory_schema(api_book: dict, region: str = "US") -> dict:
                 genre_paths.append(path)
     genre_str = ", ".join(genre_paths)
 
-    # Rating is nested
+    # Rating is nested. Three separate scores: overall, performance (narration),
+    # story. Useful signal for recommendations (a book may rate high overall
+    # but be carried entirely by performance, or vice versa).
     rating = api_book.get("rating") or {}
     overall = rating.get("overall_distribution") or {}
+    perf = rating.get("performance_distribution") or {}
+    story = rating.get("story_distribution") or {}
     rating_average = overall.get("average_rating", "")
     rating_count = overall.get("num_ratings", "") or rating.get("num_reviews", "")
+    perf_rating = perf.get("average_rating", "")
+    perf_count = perf.get("num_ratings", "")
+    story_rating = story.get("average_rating", "")
+    story_count = story.get("num_ratings", "")
 
     # Duration: API gives runtime_length_min
     runtime_min = api_book.get("runtime_length_min") or 0
@@ -292,9 +302,13 @@ def map_to_inventory_schema(api_book: dict, region: str = "US") -> dict:
         "isbn": safe_str(api_book.get("isbn")),
         "sku": safe_str(api_book.get("sku")),
 
-        # --- Ratings ---
+        # --- Ratings (overall + per-aspect for recommendation signal) ---
         "rating_average": str(rating_average) if rating_average else "",
         "rating_count": str(rating_count) if rating_count else "",
+        "performance_rating": str(perf_rating) if perf_rating else "",
+        "performance_rating_count": str(perf_count) if perf_count else "",
+        "story_rating": str(story_rating) if story_rating else "",
+        "story_rating_count": str(story_count) if story_count else "",
 
         # --- Dates ---
         "purchase_date": safe_str(api_book.get("purchase_date")),
