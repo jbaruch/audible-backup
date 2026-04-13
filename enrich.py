@@ -112,6 +112,12 @@ def main():
                         help="Process only this single ASIN (for testing)")
     parser.add_argument("--no-chapters", action="store_true",
                         help="Skip per-book chapter API call (faster)")
+    parser.add_argument("--refresh-chapters", action="store_true",
+                        help="Refresh chapters from Audible API even if present")
+    parser.add_argument("--refresh-all", action="store_true",
+                        help="Refresh ALL fields from Audible (overwrite local). "
+                             "Implies --refresh-chapters. Preserves only "
+                             "filename, files, m4b_path (local download paths).")
     parser.add_argument("--save-every", type=int, default=10,
                         help="Save after every N enriched books (default: 10)")
     args = parser.parse_args()
@@ -174,21 +180,38 @@ def main():
         # Map API → schema
         fresh_record = map_to_inventory_schema(api_book)
 
-        # Fetch chapters if missing and not skipped
+        # Fetch chapters if missing, not skipped, or explicit refresh requested
         if not args.no_chapters:
             existing_chapters = existing.get("chapters") or []
-            if not existing_chapters:
+            should_fetch = (
+                not existing_chapters
+                or args.refresh_chapters
+                or args.refresh_all
+            )
+            if should_fetch:
                 fresh_record["chapters"] = fetch_chapters(asin)
                 if fresh_record["chapters"]:
                     chapter_added += 1
                 # Be polite to Audible API
                 time.sleep(0.1)
             else:
-                # Keep existing rich chapter data
                 fresh_record["chapters"] = existing_chapters
 
-        # Merge
-        merged = merge_enrichment(existing, fresh_record)
+        # Merge — refresh-all overwrites everything that came from API
+        if args.refresh_all:
+            # Only preserve local-only fields (download paths)
+            preserved = {
+                k: existing.get(k)
+                for k in ("filename", "files", "m4b_path")
+                if existing.get(k)
+            }
+            merged = {**fresh_record, **preserved}
+            # Also keep any existing fields not in fresh_record (custom additions)
+            for k, v in existing.items():
+                if k not in merged and k not in fresh_record:
+                    merged[k] = v
+        else:
+            merged = merge_enrichment(existing, fresh_record)
 
         # Track what changed
         changed_fields = []
